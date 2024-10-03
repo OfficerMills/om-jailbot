@@ -129,7 +129,7 @@ async def suspend(interaction: discord.Interaction, member: discord.Member, dura
                 description=f"{member.mention}'s roles have been restored after sentence.",
                 color=discord.Color.green()
             )
-            restore_log_embed.add_field(name="Inmate ID", value=member.id)
+            restore_log_embed.add_field(name="Inmate ID", value=f"||{member.id}||")
             await log_channel.send(embed=restore_log_embed)
 
         suspended_users.pop(member.id, None)  # Remove from suspended users
@@ -179,7 +179,7 @@ async def unsuspend(interaction: discord.Interaction, member: discord.Member):
                 color=discord.Color.green()
             )
             log_embed.add_field(name="Released By", value=interaction.user.mention)
-            log_embed.add_field(name="Inmate ID", value=member.id)
+            log_embed.add_field(name="Inmate ID", value=f"||{member.id}||")
             log_embed.set_thumbnail(url=member.avatar.url if member.avatar else "")
             await log_channel.send(embed=log_embed)
 
