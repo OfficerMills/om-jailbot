@@ -14,6 +14,7 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 SUSPENDED_ROLE_ID = int(os.getenv('SUSPENDED_ROLE_ID'))
 LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID'))
 COURT_RECORD_CHANNEL_ID = int(os.getenv('COURT_RECORD_CHANNEL_ID'))
+BACKGROUND_CHANNEL_ID = int(os.getenv('BACKGROUND_CHANNEL_ID'))
 ALLOWED_ROLES = [int(role_id) for role_id in os.getenv('ALLOWED_ROLES', '').split(',') if role_id]
 
 # Validation checks
@@ -25,6 +26,8 @@ if not LOG_CHANNEL_ID:
     raise ValueError("LOG_CHANNEL_ID environment variable is required")
 if not COURT_RECORD_CHANNEL_ID:
     raise ValueError("COURT_RECORD_CHANNEL_ID environment variable is required")
+if not BACKGROUND_CHANNEL_ID:
+    raise ValueError("BACKGROUND_CHANNEL_ID environment variable is required")
 if not ALLOWED_ROLES:
     raise ValueError("ALLOWED_ROLES environment variable is required")
 
@@ -53,8 +56,8 @@ class DatabaseManager:
                 user_id INTEGER PRIMARY KEY,
                 guild_id INTEGER NOT NULL,
                 suspended_by INTEGER NOT NULL,
-                start_time TIMESTAMP NOT NULL,
-                end_time TIMESTAMP NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
                 duration_text TEXT NOT NULL,
                 previous_roles TEXT NOT NULL,
                 is_active BOOLEAN DEFAULT 1,
@@ -70,7 +73,7 @@ class DatabaseManager:
                 guild_id INTEGER NOT NULL,
                 action TEXT NOT NULL,
                 performed_by INTEGER NOT NULL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                timestamp TEXT DEFAULT (datetime('now')),
                 details TEXT
             )
         ''')
@@ -80,7 +83,24 @@ class DatabaseManager:
             CREATE TABLE IF NOT EXISTS sticky_messages (
                 channel_id INTEGER PRIMARY KEY,
                 message_id INTEGER NOT NULL,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                last_updated TEXT DEFAULT (datetime('now'))
+            )
+        ''')
+        
+        # Create criminal_records table for comprehensive record keeping
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS criminal_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                guild_id INTEGER NOT NULL,
+                sentenced_by INTEGER NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT,
+                actual_end_time TEXT,
+                duration_text TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                released_by INTEGER,
+                release_type TEXT DEFAULT 'TIME_SERVED'
             )
         ''')
         
@@ -96,18 +116,29 @@ class DatabaseManager:
         end_time = start_time + timedelta(seconds=duration_seconds)
         roles_json = json.dumps([role.id for role in previous_roles])
         
+        # Store as ISO format strings to avoid SQLite datetime issues
+        start_time_str = start_time.isoformat()
+        end_time_str = end_time.isoformat()
+        
         cursor.execute('''
             INSERT OR REPLACE INTO suspensions 
             (user_id, guild_id, suspended_by, start_time, end_time, duration_text, previous_roles, reason)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (user_id, guild_id, suspended_by, start_time, end_time, duration_text, roles_json, reason))
+        ''', (user_id, guild_id, suspended_by, start_time_str, end_time_str, duration_text, roles_json, reason))
         
         # Add to logs
         cursor.execute('''
             INSERT INTO suspension_logs 
-            (user_id, guild_id, action, performed_by, details)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user_id, guild_id, "SUSPENDED", suspended_by, f"Duration: {duration_text}"))
+            (user_id, guild_id, action, performed_by, details, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, guild_id, "SUSPENDED", suspended_by, f"Duration: {duration_text}", start_time_str))
+        
+        # Add to criminal records
+        cursor.execute('''
+            INSERT INTO criminal_records 
+            (user_id, guild_id, sentenced_by, start_time, end_time, duration_text, reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, guild_id, suspended_by, start_time_str, end_time_str, duration_text, reason))
         
         conn.commit()
         conn.close()
@@ -133,12 +164,28 @@ class DatabaseManager:
         
         cursor.execute('''
             SELECT * FROM suspensions 
-            WHERE is_active = 1 AND end_time > datetime('now')
+            WHERE is_active = 1
         ''')
         
         results = cursor.fetchall()
         conn.close()
-        return results
+        
+        # Filter by end_time in Python to avoid SQLite datetime issues
+        current_time = datetime.now()
+        active_suspensions = []
+        for result in results:
+            try:
+                if isinstance(result[4], str):
+                    end_time = datetime.fromisoformat(result[4])
+                else:
+                    end_time = result[4]
+                
+                if end_time > current_time:
+                    active_suspensions.append(result)
+            except (ValueError, TypeError):
+                continue
+        
+        return active_suspensions
     
     def get_expired_suspensions(self):
         """Get all expired suspensions that are still marked as active"""
@@ -147,12 +194,29 @@ class DatabaseManager:
         
         cursor.execute('''
             SELECT * FROM suspensions 
-            WHERE is_active = 1 AND end_time <= datetime('now')
+            WHERE is_active = 1
         ''')
         
         results = cursor.fetchall()
         conn.close()
-        return results
+        
+        # Filter by end_time in Python to avoid SQLite datetime issues
+        current_time = datetime.now()
+        expired_suspensions = []
+        for result in results:
+            try:
+                if isinstance(result[4], str):
+                    end_time = datetime.fromisoformat(result[4])
+                else:
+                    end_time = result[4]
+                
+                if end_time <= current_time:
+                    expired_suspensions.append(result)
+            except (ValueError, TypeError):
+                # If we can't parse the datetime, consider it expired for safety
+                expired_suspensions.append(result)
+        
+        return expired_suspensions
     
     def end_suspension(self, user_id, ended_by=None):
         """End a suspension"""
@@ -174,11 +238,20 @@ class DatabaseManager:
         
         # Add to logs
         action = "RELEASED" if ended_by else "EXPIRED"
+        current_time = datetime.now().isoformat()
         cursor.execute('''
             INSERT INTO suspension_logs 
-            (user_id, guild_id, action, performed_by, details)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (user_id, suspension[1], action, ended_by or 0, ""))
+            (user_id, guild_id, action, performed_by, details, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (user_id, suspension[1], action, ended_by or 0, "", current_time))
+        
+        # Update criminal records with actual end time and release info
+        release_type = "MANUAL_RELEASE" if ended_by else "TIME_SERVED"
+        cursor.execute('''
+            UPDATE criminal_records 
+            SET actual_end_time = ?, released_by = ?, release_type = ?
+            WHERE user_id = ? AND actual_end_time IS NULL
+        ''', (current_time, ended_by, release_type, user_id))
         
         conn.commit()
         conn.close()
@@ -190,6 +263,86 @@ class DatabaseManager:
         if suspension:
             return json.loads(suspension[6])  # previous_roles column
         return []
+    
+    def get_criminal_record(self, user_id, guild_id):
+        """Get complete criminal record for a user in a specific guild"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT * FROM criminal_records 
+            WHERE user_id = ? AND guild_id = ?
+        ''', (user_id, guild_id))
+        
+        results = cursor.fetchall()
+        conn.close()
+        
+        # Sort by start_time in Python to avoid SQLite datetime issues
+        def sort_key(record):
+            try:
+                start_time_str = record[4]  # start_time is at index 4
+                if isinstance(start_time_str, str):
+                    return datetime.fromisoformat(start_time_str)
+                else:
+                    return start_time_str
+            except (ValueError, TypeError, IndexError):
+                return datetime.min  # Put problematic records at the end
+        
+        # Sort in descending order (most recent first)
+        try:
+            results.sort(key=sort_key, reverse=True)
+        except Exception as e:
+            print(f"Error sorting criminal records: {e}")
+            # Return unsorted if sorting fails
+        
+        return results
+    
+    def get_total_time_served(self, user_id, guild_id):
+        """Calculate total time served by a user across all sentences"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT start_time, end_time, actual_end_time FROM criminal_records 
+            WHERE user_id = ? AND guild_id = ?
+        ''', (user_id, guild_id))
+        
+        records = cursor.fetchall()
+        conn.close()
+        
+        total_seconds = 0
+        for record in records:
+            try:
+                # Safely parse start_time
+                if isinstance(record[0], str):
+                    start_time = datetime.fromisoformat(record[0])
+                else:
+                    start_time = record[0]
+                
+                actual_end = record[2]  # actual_end_time
+                scheduled_end = record[1]  # end_time
+                
+                if actual_end:
+                    # They were released (either manually or automatically)
+                    if isinstance(actual_end, str):
+                        end_time = datetime.fromisoformat(actual_end)
+                    else:
+                        end_time = actual_end
+                else:
+                    # Still serving or record incomplete, use scheduled end
+                    if isinstance(scheduled_end, str):
+                        end_time = datetime.fromisoformat(scheduled_end)
+                    else:
+                        end_time = scheduled_end
+                
+                time_served = (end_time - start_time).total_seconds()
+                total_seconds += max(0, time_served)  # Ensure non-negative
+                
+            except (ValueError, TypeError) as e:
+                print(f"Error calculating time served for record {record}: {e}")
+                continue  # Skip records with bad datetime data
+        
+        return total_seconds
     
     def get_sticky_message_id(self, channel_id):
         """Get the stored sticky message ID for a channel"""
@@ -210,11 +363,12 @@ class DatabaseManager:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
+        current_time = datetime.now().isoformat()
         cursor.execute('''
             INSERT OR REPLACE INTO sticky_messages 
             (channel_id, message_id, last_updated)
             VALUES (?, ?, ?)
-        ''', (channel_id, message_id, datetime.now()))
+        ''', (channel_id, message_id, current_time))
         
         conn.commit()
         conn.close()
@@ -229,6 +383,49 @@ def convert_duration_to_seconds(duration):
         "30 days": 30 * 24 * 3600
     }
     return duration_map.get(duration, -1)
+
+def format_time_duration(seconds):
+    """Format seconds into a readable duration string"""
+    if seconds < 60:
+        return "Less than a minute"
+    
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    minutes = int((seconds % 3600) // 60)
+    
+    parts = []
+    if days > 0:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours > 0:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes > 0:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    
+    return ", ".join(parts)
+
+def format_role_list(guild, role_ids, list_type="removed"):
+    """Format a list of roles for display in embeds"""
+    if not role_ids:
+        return f"No roles {list_type}"
+    
+    roles = [guild.get_role(role_id) for role_id in role_ids]
+    valid_roles = [role for role in roles if role is not None]
+    
+    if not valid_roles:
+        return f"No valid roles {list_type}"
+    
+    # Sort roles by position (highest to lowest)
+    valid_roles.sort(key=lambda r: r.position, reverse=True)
+    
+    role_mentions = [role.mention for role in valid_roles]
+    
+    # If too many roles, truncate the list
+    if len(role_mentions) > 10:
+        displayed_roles = role_mentions[:10]
+        remaining = len(role_mentions) - 10
+        return "\n".join([f"• {role}" for role in displayed_roles]) + f"\n*...and {remaining} more*"
+    else:
+        return "\n".join([f"• {role}" for role in role_mentions])
 
 # Initialize database
 db = DatabaseManager()
@@ -255,8 +452,18 @@ class TimeRemainingView(discord.ui.View):
             )
             return
         
-        # Parse suspension data
-        end_time = datetime.fromisoformat(suspension[4])
+        # Parse suspension data with safe datetime handling
+        try:
+            if isinstance(suspension[4], str):
+                end_time = datetime.fromisoformat(suspension[4])
+            else:
+                end_time = suspension[4]
+        except (ValueError, TypeError):
+            await interaction.response.send_message(
+                "❌ Error: Unable to parse your sentence data. Please contact an administrator.",
+                ephemeral=True
+            )
+            return
         remaining_time = end_time - datetime.now()
         
         if remaining_time.total_seconds() <= 0:
@@ -267,19 +474,7 @@ class TimeRemainingView(discord.ui.View):
             return
         
         # Format remaining time
-        days = remaining_time.days
-        hours, remainder = divmod(remaining_time.seconds, 3600)
-        minutes, _ = divmod(remainder, 60)
-        
-        time_str = []
-        if days > 0:
-            time_str.append(f"{days} day{'s' if days != 1 else ''}")
-        if hours > 0:
-            time_str.append(f"{hours} hour{'s' if hours != 1 else ''}")
-        if minutes > 0:
-            time_str.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
-        
-        remaining_str = ", ".join(time_str) if time_str else "Less than a minute"
+        remaining_str = format_time_duration(remaining_time.total_seconds())
         
         embed = discord.Embed(
             title="⏰ Your Remaining Time",
@@ -294,8 +489,14 @@ class TimeRemainingView(discord.ui.View):
 
 def is_allowed_role():
     async def predicate(interaction: discord.Interaction):
-        return any(role.id in ALLOWED_ROLES for role in interaction.user.roles)
-    return commands.check(predicate)
+        if not any(role.id in ALLOWED_ROLES for role in interaction.user.roles):
+            await interaction.response.send_message(
+                "❌ **Access Denied**\nYou don't have permission to use this command.", 
+                ephemeral=True
+            )
+            return False
+        return True
+    return discord.app_commands.check(predicate)
 
 async def create_sticky_embed():
     """Create the court record sticky embed"""
@@ -444,19 +645,16 @@ async def check_expired_suspensions():
                     log_channel = bot.get_channel(LOG_CHANNEL_ID)
                     
                     # Calculate how long they were actually incarcerated
-                    start_time = datetime.fromisoformat(suspension[3])
+                    try:
+                        if isinstance(suspension[3], str):
+                            start_time = datetime.fromisoformat(suspension[3])
+                        else:
+                            start_time = suspension[3]
+                    except (ValueError, TypeError):
+                        start_time = datetime.now()  # Fallback
+                    
                     actual_time_served = datetime.now() - start_time
-                    days_served = actual_time_served.days
-                    hours_served, remainder = divmod(actual_time_served.seconds, 3600)
-                    
-                    # Format time served
-                    served_str = []
-                    if days_served > 0:
-                        served_str.append(f"{days_served} day{'s' if days_served != 1 else ''}")
-                    if hours_served > 0:
-                        served_str.append(f"{hours_served} hour{'s' if hours_served != 1 else ''}")
-                    
-                    time_served_display = ", ".join(served_str) if served_str else "Less than an hour"
+                    time_served_display = format_time_duration(actual_time_served.total_seconds())
                     
                     # Create confirmation embed (similar to manual release)
                     confirmation_embed = discord.Embed(
@@ -476,7 +674,7 @@ async def check_expired_suspensions():
                     if log_channel:
                         await log_channel.send(embed=confirmation_embed)
                     
-                    # Create detailed log embed
+                    # Create detailed log embed with role information
                     if log_channel:
                         log_embed = discord.Embed(
                             title="Automatic Release Log",
@@ -489,6 +687,11 @@ async def check_expired_suspensions():
                         log_embed.add_field(name="Start Time", value=f"<t:{int(start_time.timestamp())}:F>", inline=True)
                         log_embed.add_field(name="Completion Time", value=f"<t:{int(datetime.now().timestamp())}:F>", inline=True)
                         log_embed.add_field(name="Time Served", value=time_served_display, inline=True)
+                        
+                        # Add roles restored field
+                        roles_restored = format_role_list(guild, previous_role_ids, "restored")
+                        log_embed.add_field(name="Roles Restored", value=roles_restored, inline=False)
+                        
                         log_embed.add_field(name="Inmate ID", value=f"||{user_id}||", inline=False)
                         log_embed.set_thumbnail(url=member.avatar.url if member.avatar else "")
                         
@@ -563,7 +766,7 @@ async def on_ready():
 @bot.tree.command(name="jail", description="Jail a user for a specific time")
 @is_allowed_role()
 @discord.app_commands.choices(duration=SUSPENSION_TIME_OPTIONS)
-async def suspend(interaction: discord.Interaction, member: discord.Member, duration: str):
+async def suspend(interaction: discord.Interaction, member: discord.Member, duration: str, reason: str = "No reason provided"):
     await interaction.response.defer(thinking=True)
 
     # Check if user is already suspended
@@ -595,7 +798,8 @@ async def suspend(interaction: discord.Interaction, member: discord.Member, dura
             interaction.user.id, 
             duration_seconds, 
             duration, 
-            current_roles
+            current_roles,
+            reason
         )
 
         # Send confirmation embed
@@ -604,8 +808,9 @@ async def suspend(interaction: discord.Interaction, member: discord.Member, dura
             description=f"{member.mention} has been incarcerated for {duration}.",
             color=discord.Color.red()
         )
-        embed.add_field(name="Sentenced By", value=interaction.user.mention)
-        embed.add_field(name="Duration", value=duration)
+        embed.add_field(name="Sentenced By", value=interaction.user.mention, inline=True)
+        embed.add_field(name="Duration", value=duration, inline=True)
+        embed.add_field(name="Reason", value=reason, inline=True)
         embed.set_thumbnail(url=member.avatar.url if member.avatar else "")
         
         # Add your original footer with timestamp
@@ -621,9 +826,16 @@ async def suspend(interaction: discord.Interaction, member: discord.Member, dura
                 description=f"{member.mention} was incarcerated.",
                 color=discord.Color.red()
             )
-            log_embed.add_field(name="Arresting Officer", value=interaction.user.mention)
-            log_embed.add_field(name="Duration", value=duration)
-            log_embed.add_field(name="Inmate ID", value=f"||{member.id}||")
+            log_embed.add_field(name="Arresting Officer", value=interaction.user.mention, inline=True)
+            log_embed.add_field(name="Duration", value=duration, inline=True)
+            log_embed.add_field(name="Reason", value=reason, inline=True)
+            
+            # Add roles removed field
+            role_ids = [role.id for role in current_roles]
+            roles_removed = format_role_list(interaction.guild, role_ids, "removed")
+            log_embed.add_field(name="Roles Removed", value=roles_removed, inline=False)
+            
+            log_embed.add_field(name="Inmate ID", value=f"||{member.id}||", inline=False)
             log_embed.set_thumbnail(url=member.avatar.url if member.avatar else "")
             
             # Add your original footer with timestamp to LOG embed too
@@ -690,8 +902,15 @@ async def unsuspend(interaction: discord.Interaction, member: discord.Member):
                 description=f"{member.mention} was released.",
                 color=discord.Color.green()
             )
-            log_embed.add_field(name="Released By", value=interaction.user.mention)
-            log_embed.add_field(name="Inmate ID", value=f"||{member.id}||")
+            log_embed.add_field(name="Released By", value=interaction.user.mention, inline=True)
+            log_embed.add_field(name="Original Sentence", value=suspension[5], inline=True)
+            log_embed.add_field(name="Reason for Sentence", value=suspension[8] if suspension[8] else "No reason provided", inline=True)
+            
+            # Add roles restored field
+            roles_restored = format_role_list(interaction.guild, previous_role_ids, "restored")
+            log_embed.add_field(name="Roles Restored", value=roles_restored, inline=False)
+            
+            log_embed.add_field(name="Inmate ID", value=f"||{member.id}||", inline=False)
             log_embed.set_thumbnail(url=member.avatar.url if member.avatar else "")
             
             # Add your original footer with timestamp
@@ -706,6 +925,265 @@ async def unsuspend(interaction: discord.Interaction, member: discord.Member):
         await interaction.followup.send(f"I don't have permission to manage roles for {member.mention}.")
     except discord.HTTPException as e:
         await interaction.followup.send(f"An error occurred while releasing {member.mention}: {e}")
+
+@bot.tree.command(name="background", description="View criminal record and background check for a user")
+async def background_check(interaction: discord.Interaction, member: discord.Member):
+    # Send a quick acknowledgment that will be deleted
+    await interaction.response.send_message("🔍 Processing background check...", ephemeral=True)
+    
+    try:
+        print(f"Starting background check for user {member.id} in guild {interaction.guild.id}")
+        
+        # Get the designated background channel
+        background_channel = bot.get_channel(BACKGROUND_CHANNEL_ID)
+        if not background_channel:
+            await interaction.edit_original_response(content="❌ Error: Background check channel not found. Please contact an administrator.")
+            return
+        
+        # Get criminal records for the user
+        records = db.get_criminal_record(member.id, interaction.guild.id)
+        print(f"Found {len(records)} criminal records")
+        
+        total_time_served = db.get_total_time_served(member.id, interaction.guild.id)
+        print(f"Total time served: {total_time_served} seconds")
+        
+        # Create main embed
+        main_embed = discord.Embed(
+            title="🔍 CRIMINAL BACKGROUND CHECK",
+            description=f"**Subject:** {member.mention}\n**User ID:** `{member.id}`\n**Guild:** {interaction.guild.name}\n**Requested by:** {interaction.user.mention}",
+            color=discord.Color.dark_red()
+        )
+        
+        # Set thumbnail to the subject's avatar
+        main_embed.set_thumbnail(url=member.avatar.url if member.avatar else member.default_avatar.url)
+        
+        # Basic information
+        join_time_text = f"<t:{int(member.joined_at.timestamp())}:D>" if member.joined_at else "Unknown"
+        main_embed.add_field(
+            name="📋 **SUBJECT INFORMATION**",
+            value=f"**Name:** {member.display_name}\n"
+                  f"**Account Created:** <t:{int(member.created_at.timestamp())}:D>\n"
+                  f"**Joined Server:** {join_time_text}",
+            inline=False
+        )
+        
+        # Criminal record summary
+        if not records:
+            main_embed.add_field(
+                name="✅ **CRIMINAL RECORD STATUS**",
+                value="```\n🟢 CLEAN RECORD\nNo criminal history found.\nSubject has no prior offenses.\n```",
+                inline=False
+            )
+        else:
+            total_sentences = len(records)
+            total_time_formatted = format_time_duration(total_time_served)
+            
+            # Check if currently incarcerated
+            current_suspension = db.get_active_suspension(member.id)
+            status = "🔴 **CURRENTLY INCARCERATED**" if current_suspension else "🟡 **PREVIOUSLY INCARCERATED**"
+            
+            main_embed.add_field(
+                name="⚠️ **CRIMINAL RECORD STATUS**",
+                value=f"```\n{status}\nTotal Offenses: {total_sentences}\nTotal Time Served: {total_time_formatted}\n```",
+                inline=False
+            )
+            
+            # Current status if incarcerated
+            if current_suspension:
+                try:
+                    end_time_raw = current_suspension[4]
+                    if isinstance(end_time_raw, str):
+                        end_time = datetime.fromisoformat(end_time_raw)
+                    else:
+                        end_time = end_time_raw
+                    
+                    remaining_time = end_time - datetime.now()
+                    
+                    if remaining_time.total_seconds() > 0:
+                        remaining_formatted = format_time_duration(remaining_time.total_seconds())
+                        main_embed.add_field(
+                            name="🔒 **CURRENT INCARCERATION STATUS**",
+                            value=f"```\n⚠️ SUBJECT IS CURRENTLY INCARCERATED\n\n"
+                                  f"Sentence: {current_suspension[5]}\n"
+                                  f"Time Remaining: {remaining_formatted}\n"
+                                  f"Release Date: {end_time.strftime('%Y-%m-%d %H:%M')}\n"
+                                  f"Reason: {current_suspension[8] if len(current_suspension) > 8 and current_suspension[8] else 'No reason provided'}\n```",
+                            inline=False
+                        )
+                except (ValueError, TypeError, IndexError) as e:
+                    print(f"Error parsing current suspension datetime: {e}")
+                    # Add basic status without time calculations
+                    main_embed.add_field(
+                        name="🔒 **CURRENT INCARCERATION STATUS**",
+                        value=f"```\n⚠️ SUBJECT IS CURRENTLY INCARCERATED\n\n"
+                              f"Sentence: {current_suspension[5] if len(current_suspension) > 5 else 'Unknown'}\n"
+                              f"Reason: {current_suspension[8] if len(current_suspension) > 8 and current_suspension[8] else 'No reason provided'}\n```",
+                        inline=False
+                    )
+        
+        # Footer information
+        central_tz = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        main_embed.set_footer(
+            text=f"©2024 | OfficerMills™ | {central_tz}",
+            icon_url="https://i.imgur.com/uQxfWpy.png"
+        )
+        
+        # Add timestamp
+        main_embed.timestamp = datetime.now()
+        
+        # Send main embed to designated channel
+        await background_channel.send(embed=main_embed)
+        
+        # If there are records, create offense history embeds
+        if records:
+            embeds_to_send = []
+            current_embed = None
+            offense_count = 0
+            embed_count = 1
+            
+            for i, record in enumerate(records):
+                print(f"Processing record {i+1}: {record}")
+                offense_count += 1
+                
+                # Safely parse datetime fields with error handling
+                try:
+                    start_time_raw = record[4]  # start_time
+                    print(f"Start time raw: {start_time_raw} (type: {type(start_time_raw)})")
+                    
+                    if isinstance(start_time_raw, str):
+                        start_time = datetime.fromisoformat(start_time_raw)
+                    else:
+                        start_time = start_time_raw  # Already a datetime object
+                    
+                    end_time_raw = record[5]  # end_time  
+                    print(f"End time raw: {end_time_raw} (type: {type(end_time_raw)})")
+                    
+                    if isinstance(end_time_raw, str):
+                        scheduled_end = datetime.fromisoformat(end_time_raw)
+                    else:
+                        scheduled_end = end_time_raw  # Already a datetime object
+                        
+                except (ValueError, TypeError, IndexError) as e:
+                    print(f"Error parsing datetime for record {record}: {e}")
+                    continue  # Skip this record if datetime parsing fails
+                
+                try:
+                    actual_end = record[6]  # actual_end_time
+                    duration_text = record[7]
+                    reason = record[8] if record[8] else "No reason provided"
+                    sentenced_by = record[3]
+                    released_by = record[9] if len(record) > 9 else None
+                    release_type = record[10] if len(record) > 10 else None
+                except IndexError as e:
+                    print(f"Error accessing record fields: {e}")
+                    continue
+                
+                # Calculate actual time served for this offense
+                if actual_end:
+                    try:
+                        if isinstance(actual_end, str):
+                            actual_end_time = datetime.fromisoformat(actual_end)
+                        else:
+                            actual_end_time = actual_end  # Already a datetime object
+                        time_served = actual_end_time - start_time
+                    except (ValueError, TypeError):
+                        # Fallback if actual_end parsing fails
+                        time_served = datetime.now() - start_time
+                else:
+                    # Still serving or incomplete record
+                    time_served = datetime.now() - start_time
+                
+                time_served_formatted = format_time_duration(time_served.total_seconds())
+                
+                # Format release information
+                if release_type == "MANUAL_RELEASE" and released_by:
+                    release_info = f"Released by <@{released_by}>"
+                elif release_type == "TIME_SERVED":
+                    release_info = "Completed full sentence"
+                else:
+                    release_info = "Status unknown"
+                
+                # Create offense field value
+                offense_value = (
+                    f"```\n"
+                    f"Charge: {reason}\n"
+                    f"Sentenced: {duration_text}\n"
+                    f"Time Served: {time_served_formatted}\n"
+                    f"Date: {start_time.strftime('%Y-%m-%d %H:%M')}\n"
+                    f"Officer: User ID {sentenced_by}\n"
+                    f"Status: {release_info}\n"
+                    f"```"
+                )
+                
+                # Check if we need a new embed (Discord limit ~6000 chars per embed)
+                if current_embed is None:
+                    current_embed = discord.Embed(
+                        title=f"📜 **OFFENSE HISTORY** - Page {embed_count}",
+                        description=f"*Criminal record for {member.display_name} (continued)*" if embed_count > 1 else "*Listed chronologically (most recent first)*",
+                        color=discord.Color.dark_red()
+                    )
+                    current_embed.set_thumbnail(url=member.avatar.url if member.avatar else member.default_avatar.url)
+                
+                # Estimate the current embed size
+                current_size = len(str(current_embed.to_dict()))
+                field_size = len(f"🚨 **OFFENSE #{offense_count}**") + len(offense_value)
+                
+                # If adding this field would exceed Discord's limit (6000 chars), start a new embed
+                if current_size + field_size > 5500:  # Leave some buffer
+                    # Add footer to current embed and save it
+                    current_embed.set_footer(
+                        text=f"©2024 | OfficerMills™ | {central_tz} | Page {embed_count}",
+                        icon_url="https://i.imgur.com/uQxfWpy.png"
+                    )
+                    embeds_to_send.append(current_embed)
+                    
+                    # Start new embed
+                    embed_count += 1
+                    current_embed = discord.Embed(
+                        title=f"📜 **OFFENSE HISTORY** - Page {embed_count}",
+                        description=f"*Criminal record for {member.display_name} (continued)*",
+                        color=discord.Color.dark_red()
+                    )
+                    current_embed.set_thumbnail(url=member.avatar.url if member.avatar else member.default_avatar.url)
+                
+                # Add the offense field (not inline)
+                current_embed.add_field(
+                    name=f"🚨 **OFFENSE #{offense_count}**",
+                    value=offense_value,
+                    inline=False
+                )
+            
+            # Add the last embed if it has content
+            if current_embed and len(current_embed.fields) > 0:
+                # Show remaining offenses count if there were more than what we could display
+                if len(records) > offense_count:
+                    additional = len(records) - offense_count
+                    current_embed.add_field(
+                        name="📋 **ADDITIONAL RECORDS**",
+                        value=f"```\n+{additional} older offense(s) truncated due to Discord limits.\nContact system administrator for complete criminal history.\n```",
+                        inline=False
+                    )
+                
+                current_embed.set_footer(
+                    text=f"©2024 | OfficerMills™ | {central_tz} | Page {embed_count}",
+                    icon_url="https://i.imgur.com/uQxfWpy.png"
+                )
+                embeds_to_send.append(current_embed)
+            
+            # Send all offense history embeds to designated channel
+            for embed in embeds_to_send:
+                await background_channel.send(embed=embed)
+        
+        # Update the ephemeral response to confirm completion
+        await interaction.edit_original_response(content=f"✅ Background check for {member.display_name} completed. Results sent to {background_channel.mention}")
+        
+        print("Successfully created and sent all embeds to designated channel")
+        
+    except Exception as e:
+        print(f"Error in background_check: {e}")
+        import traceback
+        traceback.print_exc()
+        await interaction.edit_original_response(content=f"❌ An error occurred while retrieving criminal record: {e}")
 
 if __name__ == "__main__":
     try:
