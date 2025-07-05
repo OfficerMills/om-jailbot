@@ -13,6 +13,7 @@ load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 SUSPENDED_ROLE_ID = int(os.getenv('SUSPENDED_ROLE_ID'))
 LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID'))
+COURT_RECORD_CHANNEL_ID = int(os.getenv('COURT_RECORD_CHANNEL_ID'))
 ALLOWED_ROLES = [int(role_id) for role_id in os.getenv('ALLOWED_ROLES', '').split(',') if role_id]
 
 # Validation checks
@@ -22,6 +23,8 @@ if not SUSPENDED_ROLE_ID:
     raise ValueError("SUSPENDED_ROLE_ID environment variable is required")
 if not LOG_CHANNEL_ID:
     raise ValueError("LOG_CHANNEL_ID environment variable is required")
+if not COURT_RECORD_CHANNEL_ID:
+    raise ValueError("COURT_RECORD_CHANNEL_ID environment variable is required")
 if not ALLOWED_ROLES:
     raise ValueError("ALLOWED_ROLES environment variable is required")
 
@@ -69,6 +72,15 @@ class DatabaseManager:
                 performed_by INTEGER NOT NULL,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 details TEXT
+            )
+        ''')
+        
+        # Create sticky_messages table to persist sticky message IDs
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sticky_messages (
+                channel_id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
@@ -178,6 +190,34 @@ class DatabaseManager:
         if suspension:
             return json.loads(suspension[6])  # previous_roles column
         return []
+    
+    def get_sticky_message_id(self, channel_id):
+        """Get the stored sticky message ID for a channel"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT message_id FROM sticky_messages 
+            WHERE channel_id = ?
+        ''', (channel_id,))
+        
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
+    
+    def update_sticky_message_id(self, channel_id, message_id):
+        """Store or update the sticky message ID for a channel"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT OR REPLACE INTO sticky_messages 
+            (channel_id, message_id, last_updated)
+            VALUES (?, ?, ?)
+        ''', (channel_id, message_id, datetime.now()))
+        
+        conn.commit()
+        conn.close()
 
 def convert_duration_to_seconds(duration):
     duration_map = {
@@ -195,18 +235,181 @@ db = DatabaseManager()
 
 intents = discord.Intents.default()
 intents.members = True
+intents.message_content = True
 bot = commands.Bot(command_prefix='/', intents=intents)
+
+class TimeRemainingView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # Persistent view
+    
+    @discord.ui.button(label="Time Remaining", style=discord.ButtonStyle.green, emoji="⏰", custom_id="time_remaining_button")
+    async def time_remaining_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Check if user is incarcerated
+        suspension = db.get_active_suspension(interaction.user.id)
+        
+        if not suspension:
+            await interaction.response.send_message(
+                "You are currently not incarcerated.\n"
+                "The judge here can be a real prick so I highly suggest staying out of trouble to keep it that way.",
+                ephemeral=True
+            )
+            return
+        
+        # Parse suspension data
+        end_time = datetime.fromisoformat(suspension[4])
+        remaining_time = end_time - datetime.now()
+        
+        if remaining_time.total_seconds() <= 0:
+            await interaction.response.send_message(
+                "Your sentence has expired but hasn't been processed yet. You should be released shortly.",
+                ephemeral=True
+            )
+            return
+        
+        # Format remaining time
+        days = remaining_time.days
+        hours, remainder = divmod(remaining_time.seconds, 3600)
+        minutes, _ = divmod(remainder, 60)
+        
+        time_str = []
+        if days > 0:
+            time_str.append(f"{days} day{'s' if days != 1 else ''}")
+        if hours > 0:
+            time_str.append(f"{hours} hour{'s' if hours != 1 else ''}")
+        if minutes > 0:
+            time_str.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+        
+        remaining_str = ", ".join(time_str) if time_str else "Less than a minute"
+        
+        embed = discord.Embed(
+            title="⏰ Your Remaining Time",
+            description=f"**Original Sentence:** {suspension[5]}\n"
+                       f"**Time Remaining:** {remaining_str}\n"
+                       f"**Release Time:** <t:{int(end_time.timestamp())}:F>",
+            color=discord.Color.orange()
+        )
+        embed.set_thumbnail(url=interaction.user.avatar.url if interaction.user.avatar else "")
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 def is_allowed_role():
     async def predicate(interaction: discord.Interaction):
         return any(role.id in ALLOWED_ROLES for role in interaction.user.roles)
     return commands.check(predicate)
 
+async def create_sticky_embed():
+    """Create the court record sticky embed"""
+    # Get current inmate count
+    total_inmates = 0
+    for guild in bot.guilds:
+        suspend_role = guild.get_role(SUSPENDED_ROLE_ID)
+        if suspend_role:
+            total_inmates += len(suspend_role.members)
+    
+    embed = discord.Embed(
+        title="🏛️ Court Records & Inmate Status",
+        description="Welcome to the Court Records. Click the button below to check your remaining sentence time.",
+        color=discord.Color.dark_red()
+    )
+    
+    if total_inmates == 0:
+        embed.add_field(
+            name="📊 Current Status", 
+            value="🟢 **Jail is Empty**\nAll inmates have been released!", 
+            inline=False
+        )
+    elif total_inmates == 1:
+        embed.add_field(
+            name="📊 Current Status", 
+            value="🟠 **1 Inmate** currently serving time", 
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="📊 Current Status", 
+            value=f"🔴 **{total_inmates} Inmates** currently serving time", 
+            inline=False
+        )
+    
+    embed.add_field(
+        name="ℹ️ How to Use", 
+        value="• Click **Time Remaining** to check your sentence\n"
+              "• Only you can see your personal information\n"
+              "• Information updates automatically", 
+        inline=False
+    )
+    
+    embed.set_footer(text="Stay out of trouble! • Updated automatically")
+    embed.timestamp = datetime.now()
+    
+    return embed
+
+async def send_sticky_message():
+    """Send or update the sticky message in court records channel"""
+    try:
+        channel = bot.get_channel(COURT_RECORD_CHANNEL_ID)
+        if not channel:
+            print(f"Court record channel {COURT_RECORD_CHANNEL_ID} not found")
+            return
+        
+        embed = await create_sticky_embed()
+        view = TimeRemainingView()
+        
+        # Get the stored sticky message ID from database
+        stored_message_id = db.get_sticky_message_id(COURT_RECORD_CHANNEL_ID)
+        
+        # Always delete old and create new to keep it at bottom
+        if stored_message_id:
+            try:
+                old_message = await channel.fetch_message(stored_message_id)
+                await old_message.delete()
+                print(f"Deleted old sticky message: {stored_message_id}")
+            except discord.NotFound:
+                print(f"Old sticky message {stored_message_id} not found")
+            except Exception as e:
+                print(f"Error deleting old sticky message: {e}")
+        
+        # Always create new message at bottom
+        message = await channel.send(embed=embed, view=view)
+        db.update_sticky_message_id(COURT_RECORD_CHANNEL_ID, message.id)
+        print(f"Created new sticky message at bottom: {message.id}")
+        
+    except Exception as e:
+        print(f"Error sending sticky message: {e}")
+
+async def update_bot_activity():
+    """Update the bot's activity status to show current inmate count"""
+    try:
+        total_inmates = 0
+        
+        # Count inmates across all guilds the bot is in
+        for guild in bot.guilds:
+            suspend_role = guild.get_role(SUSPENDED_ROLE_ID)
+            if suspend_role:
+                total_inmates += len(suspend_role.members)
+        
+        # Set activity based on inmate count
+        if total_inmates == 0:
+            activity = discord.Activity(type=discord.ActivityType.watching, name="an empty jail")
+        elif total_inmates == 1:
+            activity = discord.Activity(type=discord.ActivityType.watching, name="1 inmate")
+        else:
+            activity = discord.Activity(type=discord.ActivityType.watching, name=f"{total_inmates} inmates")
+        
+        await bot.change_presence(activity=activity)
+        
+        # Also update the sticky message when activity changes
+        await send_sticky_message()
+        
+    except Exception as e:
+        print(f"Error updating bot activity: {e}")
+
 async def check_expired_suspensions():
     """Background task to check for expired suspensions"""
     while not bot.is_closed():
         try:
             expired_suspensions = db.get_expired_suspensions()
+            status_updated = False
             
             for suspension in expired_suspensions:
                 user_id = suspension[0]
@@ -220,6 +423,7 @@ async def check_expired_suspensions():
                 if not member:
                     # User left the server, just mark as ended
                     db.end_suspension(user_id)
+                    status_updated = True
                     continue
                 
                 # Restore roles
@@ -231,20 +435,67 @@ async def check_expired_suspensions():
                 try:
                     if suspend_role in member.roles:
                         await member.remove_roles(suspend_role, reason="Sentence ended")
+                        status_updated = True
                     
                     if previous_roles:
                         await member.add_roles(*previous_roles, reason="Roles restored after release")
                     
-                    # Log the restoration
+                    # Send confirmation embed for automatic release
                     log_channel = bot.get_channel(LOG_CHANNEL_ID)
+                    
+                    # Calculate how long they were actually incarcerated
+                    start_time = datetime.fromisoformat(suspension[3])
+                    actual_time_served = datetime.now() - start_time
+                    days_served = actual_time_served.days
+                    hours_served, remainder = divmod(actual_time_served.seconds, 3600)
+                    
+                    # Format time served
+                    served_str = []
+                    if days_served > 0:
+                        served_str.append(f"{days_served} day{'s' if days_served != 1 else ''}")
+                    if hours_served > 0:
+                        served_str.append(f"{hours_served} hour{'s' if hours_served != 1 else ''}")
+                    
+                    time_served_display = ", ".join(served_str) if served_str else "Less than an hour"
+                    
+                    # Create confirmation embed (similar to manual release)
+                    confirmation_embed = discord.Embed(
+                        title="Inmate Released - Time Served",
+                        description=f"{member.mention} has completed their sentence and roles have been restored.",
+                        color=discord.Color.green()
+                    )
+                    confirmation_embed.add_field(name="Released By", value="Time Served", inline=True)
+                    confirmation_embed.add_field(name="Original Sentence", value=suspension[5], inline=True)
+                    confirmation_embed.add_field(name="Actual Time Served", value=time_served_display, inline=True)
+                    confirmation_embed.set_thumbnail(url=member.avatar.url if member.avatar else "")
+                    
+                    # Add your original footer with timestamp
+                    central_tz = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    confirmation_embed.set_footer(text=f"©2024 | OfficerMills™ | {central_tz}", icon_url="https://i.imgur.com/uQxfWpy.png")
+                    
                     if log_channel:
-                        restore_log_embed = discord.Embed(
-                            title="Automatic Release",
-                            description=f"<@{user_id}>'s sentence has ended and roles have been restored.",
+                        await log_channel.send(embed=confirmation_embed)
+                    
+                    # Create detailed log embed
+                    if log_channel:
+                        log_embed = discord.Embed(
+                            title="Automatic Release Log",
+                            description=f"{member.mention} was automatically released after completing their sentence.",
                             color=discord.Color.green()
                         )
-                        restore_log_embed.add_field(name="Inmate ID", value=f"||{user_id}||")
-                        await log_channel.send(embed=restore_log_embed)
+                        log_embed.add_field(name="Released By", value="Time Served", inline=True)
+                        log_embed.add_field(name="Original Sentence", value=suspension[5], inline=True)
+                        log_embed.add_field(name="Sentenced By", value=f"<@{suspension[2]}>", inline=True)
+                        log_embed.add_field(name="Start Time", value=f"<t:{int(start_time.timestamp())}:F>", inline=True)
+                        log_embed.add_field(name="Completion Time", value=f"<t:{int(datetime.now().timestamp())}:F>", inline=True)
+                        log_embed.add_field(name="Time Served", value=time_served_display, inline=True)
+                        log_embed.add_field(name="Inmate ID", value=f"||{user_id}||", inline=False)
+                        log_embed.set_thumbnail(url=member.avatar.url if member.avatar else "")
+                        
+                        # Add your original footer with timestamp
+                        central_tz = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        log_embed.set_footer(text=f"©2024 | OfficerMills™ | {central_tz}", icon_url="https://i.imgur.com/uQxfWpy.png")
+                        await log_channel.send(embed=log_embed)
                 
                 except discord.Forbidden:
                     print(f"Could not restore roles for user {user_id}")
@@ -253,6 +504,10 @@ async def check_expired_suspensions():
                 
                 # Mark suspension as ended
                 db.end_suspension(user_id)
+            
+            # Update bot activity if any releases occurred
+            if status_updated:
+                await update_bot_activity()
         
         except Exception as e:
             print(f"Error in expired suspension check: {e}")
@@ -261,10 +516,45 @@ async def check_expired_suspensions():
         await asyncio.sleep(60)
 
 @bot.event
+async def on_message(message):
+    # Ignore bot messages
+    if message.author.bot:
+        return
+    
+    # Check if message is in court record channel
+    if message.channel.id == COURT_RECORD_CHANNEL_ID:
+        # Wait a moment to avoid rate limits, then re-send sticky message
+        await asyncio.sleep(1)
+        await send_sticky_message()
+    
+    # Process other commands
+    await bot.process_commands(message)
+
+@bot.event
 async def on_ready():
-    await bot.tree.sync()
-    print(f'Logged in as {bot.user} (ID: {bot.user.id})')
+    # Add the persistent view for buttons first
+    bot.add_view(TimeRemainingView())
+    
+    # Sync commands WITHOUT clearing them
+    try:
+        synced = await bot.tree.sync()
+        print(f'Logged in as {bot.user} (ID: {bot.user.id})')
+        print(f'Synced {len(synced)} command(s):')
+        for cmd in synced:
+            print(f'  - /{cmd.name}: {cmd.description}')
+    except Exception as e:
+        print(f'Failed to sync commands: {e}')
+    
     print('Database initialized and ready!')
+    
+    # Initialize sticky message system
+    print('Initializing sticky message system...')
+    await send_sticky_message()
+    
+    # Set initial bot activity
+    await update_bot_activity()
+    print('Bot activity status set!')
+    print('Sticky message system ready!')
     
     # Start background task for checking expired suspensions
     bot.loop.create_task(check_expired_suspensions())
@@ -310,13 +600,17 @@ async def suspend(interaction: discord.Interaction, member: discord.Member, dura
 
         # Send confirmation embed
         embed = discord.Embed(
-            title="User Incarcerated",
+            title="Suspect Incarcerated",
             description=f"{member.mention} has been incarcerated for {duration}.",
             color=discord.Color.red()
         )
         embed.add_field(name="Sentenced By", value=interaction.user.mention)
         embed.add_field(name="Duration", value=duration)
         embed.set_thumbnail(url=member.avatar.url if member.avatar else "")
+        
+        # Add your original footer with timestamp
+        central_tz = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        embed.set_footer(text=f"©2024 | OfficerMills™ | {central_tz}", icon_url="https://i.imgur.com/uQxfWpy.png")
         await interaction.followup.send(embed=embed)
 
         # Log the suspension
@@ -331,7 +625,14 @@ async def suspend(interaction: discord.Interaction, member: discord.Member, dura
             log_embed.add_field(name="Duration", value=duration)
             log_embed.add_field(name="Inmate ID", value=f"||{member.id}||")
             log_embed.set_thumbnail(url=member.avatar.url if member.avatar else "")
+            
+            # Add your original footer with timestamp to LOG embed too
+            central_tz = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_embed.set_footer(text=f"©2024 | OfficerMills™ | {central_tz}", icon_url="https://i.imgur.com/uQxfWpy.png")
             await log_channel.send(embed=log_embed)
+
+        # Update bot activity status
+        await update_bot_activity()
 
     except discord.Forbidden:
         await interaction.followup.send(f"I don't have the authority to sentence {member.mention}.")
@@ -369,76 +670,42 @@ async def unsuspend(interaction: discord.Interaction, member: discord.Member):
 
         # Send confirmation embed
         embed = discord.Embed(
-            title="User Released",
+            title="Inmate Released",
             description=f"{member.mention} has been released and their roles have been restored.",
             color=discord.Color.green()
         )
         embed.add_field(name="Released By", value=interaction.user.mention)
         embed.set_thumbnail(url=member.avatar.url if member.avatar else "")
+        
+        # Add your original footer with timestamp
+        central_tz = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        embed.set_footer(text=f"©2024 | OfficerMills™ | {central_tz}", icon_url="https://i.imgur.com/uQxfWpy.png")
         await interaction.followup.send(embed=embed)
 
         # Log the release
         log_channel = bot.get_channel(LOG_CHANNEL_ID)
         if log_channel:
             log_embed = discord.Embed(
-                title="User Released",
+                title="Inmate Released",
                 description=f"{member.mention} was released.",
                 color=discord.Color.green()
             )
             log_embed.add_field(name="Released By", value=interaction.user.mention)
             log_embed.add_field(name="Inmate ID", value=f"||{member.id}||")
             log_embed.set_thumbnail(url=member.avatar.url if member.avatar else "")
+            
+            # Add your original footer with timestamp
+            central_tz = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_embed.set_footer(text=f"©2024 | OfficerMills™ | {central_tz}", icon_url="https://i.imgur.com/uQxfWpy.png")
             await log_channel.send(embed=log_embed)
+
+        # Update bot activity status
+        await update_bot_activity()
 
     except discord.Forbidden:
         await interaction.followup.send(f"I don't have permission to manage roles for {member.mention}.")
     except discord.HTTPException as e:
         await interaction.followup.send(f"An error occurred while releasing {member.mention}: {e}")
-
-@bot.tree.command(name="jailstatus", description="Check the status of a jailed user")
-@is_allowed_role()
-async def jail_status(interaction: discord.Interaction, member: discord.Member):
-    await interaction.response.defer(thinking=True)
-    
-    suspension = db.get_active_suspension(member.id)
-    if not suspension:
-        await interaction.followup.send(f"{member.mention} is not currently incarcerated.")
-        return
-    
-    # Parse suspension data
-    end_time = datetime.fromisoformat(suspension[4])
-    remaining_time = end_time - datetime.now()
-    
-    if remaining_time.total_seconds() <= 0:
-        await interaction.followup.send(f"{member.mention}'s sentence has expired but hasn't been processed yet.")
-        return
-    
-    # Format remaining time
-    days = remaining_time.days
-    hours, remainder = divmod(remaining_time.seconds, 3600)
-    minutes, _ = divmod(remainder, 60)
-    
-    time_str = []
-    if days > 0:
-        time_str.append(f"{days} day{'s' if days != 1 else ''}")
-    if hours > 0:
-        time_str.append(f"{hours} hour{'s' if hours != 1 else ''}")
-    if minutes > 0:
-        time_str.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
-    
-    remaining_str = ", ".join(time_str) if time_str else "Less than a minute"
-    
-    embed = discord.Embed(
-        title="Jail Status",
-        description=f"{member.mention} is currently incarcerated.",
-        color=discord.Color.orange()
-    )
-    embed.add_field(name="Original Duration", value=suspension[5])
-    embed.add_field(name="Time Remaining", value=remaining_str)
-    embed.add_field(name="Release Time", value=f"<t:{int(end_time.timestamp())}:F>")
-    embed.set_thumbnail(url=member.avatar.url if member.avatar else "")
-    
-    await interaction.followup.send(embed=embed)
 
 if __name__ == "__main__":
     try:
